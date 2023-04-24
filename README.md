@@ -1,2 +1,2 @@
-# LaneChanging_HDVs
-The repo for simulations on lane-changing control for CAVs in mixed traffic 
+# ACC_2023_Sim
+ This repo contains my code for ACC2023 simulation
