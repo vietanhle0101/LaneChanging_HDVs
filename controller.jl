@@ -47,7 +47,7 @@ mutable struct MPC
     v_min; v_max; a_min; a_max; α_min; α_max
     y_ref::Float64; v_ref::Float64
     lf::Float64; lr::Float64
-    st; u
+    st; u; st_H
     st_nom::Matrix{Float64}; u_nom::Matrix{Float64}
     solver
 
@@ -77,8 +77,9 @@ function set_ref(c::MPC, y_ref, v_ref)
 end
 
 "Set state from all agent states"
-function set_state(c::MPC, car::Car)
-    c.st = car.st
+function set_state(c::MPC, CAV::Car, HDV::Car)
+    c.st = CAV.st
+    c.st_H = HDV.st
 end
 
 "Set input from all agent inputs"
@@ -109,8 +110,8 @@ function predict_onestep(c::MPC, x::AbstractVector, u::AbstractVector)
 end
 
 "Function to solve MPC motion planning problem"
-function formulateMPC(c::MPC; solver = "Ipopt")
-    y_ref = c.y_ref; vd = c.v_ref; dt = c.T
+function formulateMPC(c::MPC, vd_H; solver = "Ipopt")
+    y_ref = c.y_ref; vd = c.v_ref; dt = c.T; ϵ = c.params["ϵ"]
     c.solver = solver
     if c.solver == "Ipopt"
         model = JuMP.Model(Ipopt.Optimizer)
@@ -122,6 +123,8 @@ function formulateMPC(c::MPC; solver = "Ipopt")
     @variables model begin
         z[1:4, 1:c.H+1]
         u[1:2, 1:c.H]
+        zH[1:2, 1:c.H+1]
+        uH[1:c.H]
         # s[1:2, 1:c.H+1]
     end
 
@@ -132,15 +135,20 @@ function formulateMPC(c::MPC; solver = "Ipopt")
     
     # Add dynamics constraints
     for t = 1:c.H
+        # for CAV
         β = @NLexpression(model, atan(tan(u[2,t])*c.lr/(c.lf+c.lr)))       
         @NLconstraint(model, z[1,t+1] == z[1,t] + dt*z[4,t]*cos(z[3,t]+β))
         @NLconstraint(model, z[2,t+1] == z[2,t] + dt*z[4,t]*sin(z[3,t]+β))
         @NLconstraint(model, z[3,t+1] == z[3,t] + dt*z[4,t]/c.lr*sin(β))
         @NLconstraint(model, z[4,t+1] == z[4,t] + dt*u[1,t])
+        # for HDV
+        @constraint(model, zH[1,t+1] == zH[1,t] + dt*zH[2,t] + 0.5*dt^2*uH[t])
+        @constraint(model, zH[2,t+1] == zH[2,t] + dt*uH[t])
     end
 
     # Initial condition
     @constraint(model, z[:,1] .== c.st)
+    @constraint(model, zH[:,1] .== [c.st_H[1], c.st_H[4]])
     
     # Bound constraints
     @constraints(model, begin
@@ -164,8 +172,16 @@ function formulateMPC(c::MPC; solver = "Ipopt")
 
     # Objective function
     J = sum(c.params["Wu"].*u.^2) + sum(c.params["Wv"]*(z[4,:] .- vd).^2) + sum(c.params["Wy"]*(z[2,:] .- y_ref).^2)
+                + sum(c.params["WHu"].*uH.^2) + sum(c.params["Wv"]*(zH[2,:] .- vd_H).^2)
                 # + c.params["λ"]*sum(s)
-    @objective(model, Min, J)
+    for k in 1:c.H
+        xi = z[1,k+1]; yi = z[2,k+1]
+        xj = zH[1,k+1]
+        J = @NLexpression(model, J - c.params["Wd"]*log((xi-xj)^2 + yi^2 + ϵ))
+        # @constraint(model, 5.0^2 <= (xi-xj)^2 + yi^2)
+    end
+    @NLobjective(model, Min, J)
+    # Safety constraints
 
     t_comp = @elapsed JuMP.optimize!(model)
     sol = value.(u)

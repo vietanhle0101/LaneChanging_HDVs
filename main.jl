@@ -34,37 +34,43 @@ end
 control = MPC(T, H)
 set_limit(control, bounds, parameters)
 set_ref(control, yc_f, vd)
-set_state(control, CAV)
+set_state(control, CAV, HDV_2)
 set_nominal(control, zeros(2, H))
 W_AH = 1e3
-W_H1 = 10.0 .^[0.0, 0.0]
-W_H2 = 10.0 .^[-1.0, 0.0]
-weights = Dict("Wu" => [1e1, 1e1], "Wv" => 1e-1, "Wy" => 1e-1, "λ" => 1e9,
-                "y_min" => yc_i, "y_max" => yc_f, "Δθ_min" => -0.05, "Δθ_max" => 0.05)
+W_H1 = 10.0 .^[0.0, 1.0]
+W_H2 = 10.0 .^[-1.0, 2.0]
+weights = Dict("Wu" => [1e0, 1e3], "Wv" => 1e-1, "Wy" => 1e-3, "Wd" => W_AH, "λ" => 1e9,
+        "WHu" => W_H2[1], "WHv" => W_H2[2],
+        "y_min" => yc_i, "y_max" => yc_f, "Δθ_min" => -5/180*π, "Δθ_max" => 5/180*π, "ϵ" => 1e-9)
 set_params(control, weights)
 
-formulateMPC(control)
+formulateMPC(control, vd)
 
 L = 100
 for t in 1:L
-    hw = HDV_1.st[1] - CAV.st[1]
-    v_cfm = CTH(CAV, hw, τs, ds)
-    set_ref(control, yc_f, v_cfm)
+    println("Time step ", t)
 
-    # Run CAV using MPC
-    U, _ = formulateMPC(control)
-    run_lane_changing(CAV, U[:,1])
+    set_state(control, CAV, HDV_2)
 
-    # Run HDV using IRL-CFM model
+    # Run HDV_1 using IRL-CFM model
     u_HDV_1 = input_for_HDV(Cars, 2, 1, vd, [W_H1; W_AH])
     run_car_following(HDV_1, u_HDV_1*T + HDV_1.st[4])
-    vd_2 = (HDV_1.st[1] - HDV_2.st[1] - ds)/τs 
-    println(vd_2)
-    u_HDV_2 = input_for_HDV(Cars, 3, 1, vd, [W_H2; W_AH])
+
+    # Run HDV_2 using IRL-CFM model
+    vd_2 = min(bounds["v_max"], (HDV_1.st[1] - HDV_2.st[1] - ds)/τs)
+    if distance(HDV_1, HDV_2) < distance(CAV, HDV_2) j = 2 else j = 1 end
+    u_HDV_2 = input_for_HDV(Cars, 3, j, vd_2, [W_H2; W_AH])
     run_car_following(HDV_2, u_HDV_2*T + HDV_2.st[4])
 
-    set_state(control, CAV)
+
+    # Run CAV using MPC
+    if HDV_2.st[1] - CAV.st[1] >= ds hw = HDV_2.st[1] - CAV.st[1] else hw = HDV_1.st[1] - CAV.st[1] end
+    v_cfm = CTH(CAV, hw, τs, ds)
+    set_ref(control, yc_f, v_cfm)
+    U, _ = formulateMPC(control, vd_2)
+    run_lane_changing(CAV, U[:,1])
 end
+
 
 # Plot the results
 T_hist = [T*i for i in 1:L+1]
@@ -83,6 +89,7 @@ for car in Cars
 end
 
 plot(CAV.X_hist[3,:])
+plot(HDV_1.X_hist[4,:])
 plot(HDV_2.X_hist[4,:])
 dist = sqrt.((HDV_2.X_hist[1,:]-CAV.X_hist[1,:]).^2 + (HDV_2.X_hist[2,:]-CAV.X_hist[2,:]).^2)
 plot(dist)
