@@ -16,17 +16,17 @@ solver = "Ipopt"
 
 Random.seed!(123);
 # velocity and input bounds
-bounds = Dict("v_min" => 0.0, "v_max" => 14.0, "a_min" => -3.0, "a_max" => 2.0, "α_min" => -π/6, "α_max" => π/6)
+bounds = Dict("v_min" => 0.0, "v_max" => 14.0, "a_min" => -3.0, "a_max" => 2.0, "α_min" => -π/4, "α_max" => π/4)
 parameters = Dict("lf" => 1.03, "lr" => 1.54)
 
 ## Initialize the car objects
 yc_i = -6.0; yc_f = 0.0
-vd = 12.0; τs = 2.0; ds = 5.0
+vd = 12.0; τs = 2.0; ds = 8.0
 
 CAV = Car("CAV", 1,  T, [0.0, yc_i, 0.0, 12.4])
 HDV_1 = Car("HDV", 2, T, [10.0, yc_f, 0.0, 12.0])
-# HDV_2 = Car("HDV", 3, T, [-20.0, yc_f, 0.0, 12.6])
-Cars = [CAV, HDV_1]
+HDV_2 = Car("HDV", 3, T, [-20.0, yc_f, 0.0, 12.6])
+Cars = [CAV, HDV_1, HDV_2]
 for car in Cars
     set_limit(car, bounds, parameters)
 end
@@ -36,7 +36,10 @@ set_limit(control, bounds, parameters)
 set_ref(control, yc_f, vd)
 set_state(control, CAV)
 set_nominal(control, zeros(2, H))
-weights = Dict("Wu" => [1e1, 1e1], "Wv" => 1e-1, "Wy" => 1e-1, "λ" => 1e10,
+W_AH = 1e3
+W_H1 = 10.0 .^[0.0, 0.0]
+W_H2 = 10.0 .^[-1.0, 0.0]
+weights = Dict("Wu" => [1e1, 1e1], "Wv" => 1e-1, "Wy" => 1e-1, "λ" => 1e9,
                 "y_min" => yc_i, "y_max" => yc_f, "Δθ_min" => -0.05, "Δθ_max" => 0.05)
 set_params(control, weights)
 
@@ -48,11 +51,17 @@ for t in 1:L
     v_cfm = CTH(CAV, hw, τs, ds)
     set_ref(control, yc_f, v_cfm)
 
-    # run_car_following(CAV, v_cfm)
+    # Run CAV using MPC
     U, _ = formulateMPC(control)
     run_lane_changing(CAV, U[:,1])
 
-    run_car_following(HDV_1, vd)
+    # Run HDV using IRL-CFM model
+    u_HDV_1 = input_for_HDV(Cars, 2, 1, vd, [W_H1; W_AH])
+    run_car_following(HDV_1, u_HDV_1*T + HDV_1.st[4])
+    vd_2 = (HDV_1.st[1] - HDV_2.st[1] - ds)/τs 
+    println(vd_2)
+    u_HDV_2 = input_for_HDV(Cars, 3, 1, vd, [W_H2; W_AH])
+    run_car_following(HDV_2, u_HDV_2*T + HDV_2.st[4])
 
     set_state(control, CAV)
 end
@@ -73,8 +82,11 @@ for car in Cars
     display(plot!(T_hist, car.X_hist[1,:], color=c))
 end
 
-# plot(CAV.X_hist[1,:], CAV.X_hist[2,:])
 plot(CAV.X_hist[3,:])
+plot(HDV_2.X_hist[4,:])
+dist = sqrt.((HDV_2.X_hist[1,:]-CAV.X_hist[1,:]).^2 + (HDV_2.X_hist[2,:]-CAV.X_hist[2,:]).^2)
+plot(dist)
+
 # plot(U_hist[1,:])
 # plot(comp_time)
 

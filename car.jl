@@ -92,7 +92,7 @@ function CTH(c::Car, dist, τs, ds)
 end
 
 "Find the control input to track a desired speed profile"
-function PID(c::Car, vd; Kp = 1e-1)
+function PID(c::Car, vd; Kp = 1e0)
     v = c.st[4]
     return Kp*(vd-v)
 end

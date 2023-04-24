@@ -6,26 +6,26 @@ using Optim, Convex, JuMP, OSQP, Ipopt
 const cutoff = 1e-4 # small cutoff in constraints to avoid numerical issues with optimization solvers
 
 "Function to get control input for the HDVs in the simulation"
-function input_for_HDV(cars::Vector{Car}, my_car::Int64, your_car::Int64, vd::Float64, W; T = 0.2, uncertain = false)
+function input_for_HDV(cars::Vector{Car}, my_car::Int64, your_car::Int64, vd::Float64, W; T = 0.2, ϵ = 1e-3, uncertain = false)
     my_x = cars[my_car].st[1]; my_y = cars[my_car].st[2]
     my_v = cars[my_car].st[4]
     your_x = cars[your_car].st[1]; your_y = cars[your_car].st[2]
     your_v = cars[your_car].st[4]
 
-    u = IRL_CFM(my_p, my_v, your_p, your_v, vd, W; T, uncertain)
+    u = IRL_CFM(my_x, my_y, my_v, your_x, your_y, your_v, vd, W, T, ϵ, uncertain)
     return u
 end
 
 "Solve optimization problem (IRL) to find control action for HDV"
-function IRL_CFM(p2_0, v2_0, p1_0, v1_0, vd, W; T = 0.2, uncertain = false)
+function IRL_CFM(my_x, my_y, my_v, your_x, your_y, your_v, v_d, W, T, ϵ, uncertain)
     C = zeros(7)
     C[1] = W[1] + W[2]*T^2
-    C[2] = 2W[2]*(v2_0 - v_ref)*T
-    C[3] = W[2]*(v2_0 - v_ref)^2
+    C[2] = 2W[2]*(my_v - v_d)*T
+    C[3] = W[2]*(my_v - v_d)^2
     C[4] = W[3]
     C[5] = (0.5T^2)^2
-    C[6] = 2*0.5T^2*(p2_0+T*v2_0)
-    C[7] = ((p1_0+v1_0*T)^2+(p2_0+v2_0*T)^2)
+    C[6] = 2*0.5T^2*(my_x + T*my_v - your_x - T*your_v)
+    C[7] = (my_y - your_y)^2 + (my_x + T*my_v - your_x - T*your_v)^2 + ϵ
 
     # The solution of this problem can be found by finding root of a polynomial (derivative of objective function)
     root = roots(Polynomial([(C[2]C[7]-C[4]C[6]), (C[2]C[6]+2C[1]C[7]-2C[4]C[5]), (C[2]C[5]+2C[1]C[6]), 2C[1]C[5]]))
