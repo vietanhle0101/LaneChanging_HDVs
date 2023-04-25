@@ -110,7 +110,7 @@ function predict_onestep(c::MPC, x::AbstractVector, u::AbstractVector)
 end
 
 "Function to solve MPC motion planning problem"
-function formulateMPC(c::MPC, vd_H; solver = "Ipopt")
+function nonlinearMPC(c::MPC, vd_H; solver = "Ipopt")
     y_ref = c.y_ref; vd = c.v_ref; dt = c.T; ϵ = c.params["ϵ"]
     c.solver = solver
     if c.solver == "Ipopt"
@@ -118,6 +118,8 @@ function formulateMPC(c::MPC, vd_H; solver = "Ipopt")
     end
     set_silent(model)
     set_time_limit_sec(model, 0.2)
+    set_optimizer_attribute(model, "tol", 1e-3)
+    set_optimizer_attribute(model, "max_iter", 100)
 
     # Define decision variables
     @variables model begin
@@ -141,6 +143,89 @@ function formulateMPC(c::MPC, vd_H; solver = "Ipopt")
         @NLconstraint(model, z[2,t+1] == z[2,t] + dt*z[4,t]*sin(z[3,t]+β))
         @NLconstraint(model, z[3,t+1] == z[3,t] + dt*z[4,t]/c.lr*sin(β))
         @NLconstraint(model, z[4,t+1] == z[4,t] + dt*u[1,t])
+        # for HDV
+        @constraint(model, zH[1,t+1] == zH[1,t] + dt*zH[2,t] + 0.5*dt^2*uH[t])
+        @constraint(model, zH[2,t+1] == zH[2,t] + dt*uH[t])
+    end
+
+    # Initial condition
+    @constraint(model, z[:,1] .== c.st)
+    @constraint(model, zH[:,1] .== [c.st_H[1], c.st_H[4]])
+    
+    # Bound constraints
+    @constraints(model, begin
+        c.a_min .<= u[1,:] .<= c.a_max
+        c.α_min .<= u[2,:] .<= c.α_max
+        c.v_min .<= z[4,:] .<= c.v_max
+        # 0.0 .<= s
+    end)
+
+    @constraints(model, begin
+        # c.params["y_min"] .<= z[2,:] .+ s[1,:] 
+        # -c.params["y_max"] .<= -z[2,:] .+ s[2,:] 
+        c.params["y_min"] .<= z[2,:] .<= c.params["y_max"]
+    end)
+
+    # Ramp constraints
+    @constraints(model, begin
+        c.params["Δθ_min"]*dt <= z[3,1] - c.st[3] <= c.params["Δθ_max"]*dt
+        c.params["Δθ_min"]*dt .<= z[3,2:end] - z[3,1:end-1] .<= c.params["Δθ_max"]*dt
+    end)
+
+    # Objective function
+    J = sum(c.params["Wu"].*u.^2) + sum(c.params["Wv"]*(z[4,:] .- vd).^2) + sum(c.params["Wy"]*(z[2,:] .- y_ref).^2)
+                + sum(c.params["WHu"].*uH.^2) + sum(c.params["Wv"]*(zH[2,:] .- vd_H).^2)
+                # + c.params["λ"]*sum(s)
+    for k in 1:c.H
+        xi = z[1,k+1]; yi = z[2,k+1]
+        xj = zH[1,k+1]
+        J = @NLexpression(model, J - c.params["Wd"]*log((xi-xj)^2 + yi^2 + ϵ))
+        # @constraint(model, 5.0^2 <= (xi-xj)^2 + yi^2)
+    end
+    @NLobjective(model, Min, J)
+    # Safety constraints
+
+    t_comp = @elapsed JuMP.optimize!(model)
+    sol = value.(u)
+    set_nominal(c, sol)
+    return sol, t_comp
+end
+
+function linearizedMPC(c::MPC, vd_H; solver = "Ipopt")
+    y_ref = c.y_ref; vd = c.v_ref; dt = c.T; ϵ = c.params["ϵ"]
+    c.solver = solver
+    if c.solver == "Ipopt"
+        model = JuMP.Model(Ipopt.Optimizer)
+    end
+    set_silent(model)
+    set_time_limit_sec(model, 0.2)
+    set_optimizer_attribute(model, "tol", 1e-3)
+    set_optimizer_attribute(model, "max_iter", 100)
+    
+    # Define decision variables
+    @variables model begin
+        z[1:4, 1:c.H+1]
+        u[1:2, 1:c.H]
+        zH[1:2, 1:c.H+1]
+        uH[1:c.H]
+        # s[1:2, 1:c.H+1]
+    end
+
+    warm_u = hcat(c.u_nom[:,2:end], zeros(2,1))
+    set_nominal(c, warm_u)
+    set_start_value.(u, c.u_nom)
+    set_start_value.(z, c.st_nom)
+    
+    # Add dynamics constraints
+    for t = 1:c.H
+        # for CAV
+        # β = @expression(model, u[2,t]*c.lr/(c.lf+c.lr))
+        β_nom = atan(tan(c.u_nom[2,t])*c.lr/(c.lf+c.lr))
+        θ_nom = c.st_nom[3,t]; v_nom = c.st_nom[4,t] 
+        @constraint(model, z[1,t+1] == z[1,t] + dt*(v_nom*cos(θ_nom+β_nom) - v_nom*sin(θ_nom+β_nom)*(z[3,t]-θ_nom+u[2,t]*c.lr/(c.lf+c.lr)-β_nom) + cos(θ_nom+β_nom)*(z[4,t]-v_nom)) )
+        @constraint(model, z[2,t+1] == z[2,t] + dt*(v_nom*sin(θ_nom+β_nom) + v_nom*cos(θ_nom+β_nom)*(z[3,t]-θ_nom+u[2,t]*c.lr/(c.lf+c.lr)-β_nom) + sin(θ_nom+β_nom)*(z[4,t]-v_nom)) )
+        @constraint(model, z[3,t+1] == z[3,t] + dt*(v_nom*sin(β_nom) + v_nom*cos(β_nom)*(u[2,t]*c.lr/(c.lf+c.lr)-β_nom) + sin(β_nom)*(z[4,t]-v_nom))/c.lr)
+        @constraint(model, z[4,t+1] == z[4,t] + dt*u[1,t])
         # for HDV
         @constraint(model, zH[1,t+1] == zH[1,t] + dt*zH[2,t] + 0.5*dt^2*uH[t])
         @constraint(model, zH[2,t+1] == zH[2,t] + dt*uH[t])
