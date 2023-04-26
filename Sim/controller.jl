@@ -73,15 +73,11 @@ function set_ref(c::MPC, y_ref, v_ref)
     c.v_ref = v_ref
 end
 
-"Set state from all agent states"
+"Set state from all states"
 function set_state(c::MPC, CAV::Car, HDV::Car)
     c.st = CAV.st
     c.st_H = HDV.st
-end
-
-"Set input from all agent inputs"
-function set_input(c::MPC, car::Car)
-    c.u = car.u
+    c.u = CAV.u
 end
 
 "Predict nominal trajectory over control horizon given the nominal control inputs, for warm-starting"
@@ -135,16 +131,17 @@ function nonlinearMPC(c::MPC, vd_H; solver = "Ipopt")
     set_start_value.(z, c.st_nom)
 
     # Add dynamics constraints
+    ν = c.lr/(c.lf+c.lr) 
     for t = 1:c.H
         # for CAV
-        # β = @NLexpression(model, atan(tan(u[2,t])*c.lr/(c.lf+c.lr)))       
-        β = @expression(model, u[2,t]*c.lr/(c.lf+c.lr)) # Nice approximation of the above expression tan(x)≈x
+        # β = @NLexpression(model, atan(tan(u[2,t])*ν))       
+        β = @expression(model, u[2,t]*ν) # Nice approximation of the above expression tan(x)≈x
         @NLconstraint(model, z[1,t+1] == z[1,t] + dt*z[4,t]*cos(z[3,t]+β))
         @NLconstraint(model, z[2,t+1] == z[2,t] + dt*z[4,t]*sin(z[3,t]+β))
-        @NLconstraint(model, z[3,t+1] == z[3,t] + dt*z[4,t]/c.lr*sin(β))
-        @NLconstraint(model, z[4,t+1] == z[4,t] + dt*u[1,t])
+        @NLconstraint(model, z[3,t+1] == z[3,t] + dt/c.lr*z[4,t]*sin(β))
+        @constraint(model, z[4,t+1] == z[4,t] + dt*u[1,t])
         # for HDV
-        @constraints(model, begin zH[:,t+1] .== zH[:,t] + dt*[zH[2,t], 0] + dt*uH[t]*[0.5*dt, 1] end)
+        @constraints(model, begin zH[:,t+1] .== zH[:,t] + [dt*zH[2,t],0] + [0.5*dt*2,dt]*uH[t] end)
     end
 
     # Initial condition
@@ -178,7 +175,7 @@ function nonlinearMPC(c::MPC, vd_H; solver = "Ipopt")
     for k in 1:c.H
         xi = z[1,k+1]; yi = z[2,k+1]
         xj = zH[1,k+1]
-        J = @NLexpression(model, J - c.params["Wd"]*log((xi-xj)^2 + yi^2 + ϵ))
+        J = @NLexpression(model, J - c.params["Wd"]*log((xi-xj)^2 + (2yi)^2 + ϵ))
         # @constraint(model, 5.0^2 <= (xi-xj)^2 + yi^2)
     end
     @NLobjective(model, Min, J)

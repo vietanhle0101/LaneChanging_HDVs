@@ -15,15 +15,15 @@ solver = "Ipopt"
 Random.seed!(16);
 # velocity and input bounds
 bounds = Dict("v_min" => 0.0, "v_max" => 30.0, "a_min" => -3.0, "a_max" => 2.0, "α_min" => -π/12, "α_max" => π/12)
-parameters = Dict("lf" => 1.03, "lr" => 1.54)
+parameters = Dict("lf" => 1.04, "lr" => 1.54)
 
 ## Initialize the car objects
 yc_i = -6.0; yc_f = 0.0
 vd = 28.0; τs = 2.0; ds = 8.0
 
-CAV_1 = Car("CAV", 1,  T, [0.0, yc_i, 0.0, 28.4])
+CAV_1 = Car("CAV", 1,  T, [0.0, yc_i, 0.0, 26.6])
 HDV_2 = Car("HDV", 2, T, [30.0, yc_f, 0.0, 28.0])
-HDV_3 = Car("HDV", 3, T, [-30.0, yc_f, 0.0, 26.6])
+HDV_3 = Car("HDV", 3, T, [0.0, yc_f, 0.0, 28.6])
 Cars = [CAV_1, HDV_2, HDV_3]
 for car in Cars
     set_limit(car, bounds, parameters)
@@ -36,14 +36,15 @@ set_state(control, CAV_1, HDV_3)
 set_nominal(control, zeros(2, H))
 W_AH = 1e3
 W_H2 = 10.0 .^[0.0, 1.0]
-W_H3 = 10.0 .^[-1.0, 0.0]
-weights = Dict("Wu" => [1e-1, 1e1], "Wv" => 1e-1, "Wy" => 1e-3, "Wd" => W_AH, "λ" => 1e9,
+W_H3 = 10.0 .^[-1.0, 1.0]
+weights = Dict("Wu" => [1e0, 1e2], "Wv" => 1e-1, "Wy" => 1e-2, "Wd" => W_AH, "λ" => 1e9,
         "WHu" => W_H3[1], "WHv" => W_H3[2],
-        "y_min" => yc_i, "y_max" => yc_f, "Δθ_min" => -5/180*π, "Δθ_max" => 5/180*π, "ϵ" => 1e-5)
+        "y_min" => yc_i, "y_max" => yc_f, "ϵ" => 1e-9,
+        "Δθ_min" => -π/18, "Δθ_max" => π/18)
 set_params(control, weights)
 
-# nonlinearMPC(control, vd)
-linearizedMPC(control, vd)
+nonlinearMPC(control, vd)
+# linearizedMPC(control, vd)
 
 L = 100
 t_comp = []
@@ -59,7 +60,7 @@ for t in 1:L
     # Run HDV_3 using IRL-CFM model
     vd_3 = CTH(HDV_3, HDV_2.st[1] - HDV_3.st[1], τs, ds)
     if distance(HDV_2, HDV_3) < distance(CAV_1, HDV_3) j = 2 else j = 1 end
-    u_HDV_3 = input_for_HDV(Cars, 3, j, vd_3, [W_H2; W_AH])
+    u_HDV_3 = input_for_HDV(Cars, 3, j, vd_3, [W_H3; W_AH])
     run_car_following(HDV_3, u_HDV_3*T + HDV_3.st[4])
 
     # Run CAV using MPC
