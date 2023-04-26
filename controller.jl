@@ -1,4 +1,4 @@
-using LinearAlgebra, Distributions, Polynomials
+using LinearAlgebra, Distributions, Polynomials, Roots
 using Optim, Convex, JuMP, OSQP, Ipopt
 # using Gurobi, KNITRO
 
@@ -6,31 +6,28 @@ using Optim, Convex, JuMP, OSQP, Ipopt
 const cutoff = 1e-4 # small cutoff in constraints to avoid numerical issues with optimization solvers
 
 "Function to get control input for the HDVs in the simulation"
-function input_for_HDV(cars::Vector{Car}, my_car::Int64, your_car::Int64, vd::Float64, W; T = 0.2, ϵ = 1e-3, uncertain = false)
+function input_for_HDV(cars::Vector{Car}, my_car::Int64, your_car::Int64, vd::Float64, W; T = 0.2, γ = 1e-3, uncertain = false)
     my_x = cars[my_car].st[1]; my_y = cars[my_car].st[2]
     my_v = cars[my_car].st[4]
     your_x = cars[your_car].st[1]; your_y = cars[your_car].st[2]
     your_v = cars[your_car].st[4]
 
-    u = IRL_CFM(my_x, my_y, my_v, your_x, your_y, your_v, vd, W, T, ϵ, uncertain)
+    u = IRL_CFM(my_x, my_y, my_v, your_x, your_y, your_v, vd, W; T = T, γ = γ, uncertain = uncertain)
     return u
 end
 
 "Solve optimization problem (IRL) to find control action for HDV"
-function IRL_CFM(my_x, my_y, my_v, your_x, your_y, your_v, v_d, W, T, ϵ, uncertain)
-    C = zeros(7)
-    C[1] = W[1] + W[2]*T^2
-    C[2] = 2W[2]*(my_v - v_d)*T
-    C[3] = W[2]*(my_v - v_d)^2
-    C[4] = W[3]
-    C[5] = (0.5T^2)^2
-    C[6] = 2*0.5T^2*(my_x + T*my_v - your_x - T*your_v)
-    C[7] = (my_y - your_y)^2 + (my_x + T*my_v - your_x - T*your_v)^2 + ϵ
+function IRL_CFM(my_x, my_y, my_v, your_x, your_y, your_v, v_d, W; T = 0.2, γ = 1e-3, uncertain = false)
+    q = (0.5*T^2)^2 
+    r = (my_x+T*my_v-your_x-T*your_v)/(0.5*T^2)
+    ϵ = (my_y-your_y)^2 + γ
+    p = (W[1]+T^2*W[2])/W[3]
+    v = T*W[2]*(my_v-v_d)/sqrt(p)/W[3]
 
-    # The solution of this problem can be found by finding root of a polynomial (derivative of objective function)
-    root = roots(Polynomial([(C[2]C[7]-C[4]C[6]), (C[2]C[6]+2C[1]C[7]-2C[4]C[5]), (C[2]C[5]+2C[1]C[6]), 2C[1]C[5]]))
-    sol = root[isreal.(root)]
-    u = Real(sol[1])
+    coeffs = [p*q*v*r^2+ϵ*p*v-q*r, p*q*(r^2+2r*v)+ϵ*p-q, p*q*(2r+v), p*q]
+    root = roots(Polynomial(coeffs)) # Find roots of polynomial
+    root = root[isreal.(root)]; u = Real(root[end])
+    # find_zero(Polynomial(coeffs), (-1e3, 1e3), Bisection())[end] 
 
     if uncertain
         return u + rand(Normal(0., 0.1))
@@ -117,9 +114,10 @@ function nonlinearMPC(c::MPC, vd_H; solver = "Ipopt")
         model = JuMP.Model(Ipopt.Optimizer)
     end
     set_silent(model)
-    set_time_limit_sec(model, 0.2)
+    set_time_limit_sec(model, 0.1)
     set_optimizer_attribute(model, "tol", 1e-3)
     set_optimizer_attribute(model, "max_iter", 100)
+    # set_optimizer_attribute(model, "linear_solver", "ma27")
 
     # Define decision variables
     @variables model begin
@@ -130,22 +128,23 @@ function nonlinearMPC(c::MPC, vd_H; solver = "Ipopt")
         # s[1:2, 1:c.H+1]
     end
 
+    # Set initial values for the optimization variables 
     warm_u = hcat(c.u_nom[:,2:end], zeros(2,1))
     set_nominal(c, warm_u)
     set_start_value.(u, c.u_nom)
     set_start_value.(z, c.st_nom)
-    
+
     # Add dynamics constraints
     for t = 1:c.H
         # for CAV
-        β = @NLexpression(model, atan(tan(u[2,t])*c.lr/(c.lf+c.lr)))       
+        # β = @NLexpression(model, atan(tan(u[2,t])*c.lr/(c.lf+c.lr)))       
+        β = @expression(model, u[2,t]*c.lr/(c.lf+c.lr)) # Nice approximation of the above expression tan(x)≈x
         @NLconstraint(model, z[1,t+1] == z[1,t] + dt*z[4,t]*cos(z[3,t]+β))
         @NLconstraint(model, z[2,t+1] == z[2,t] + dt*z[4,t]*sin(z[3,t]+β))
         @NLconstraint(model, z[3,t+1] == z[3,t] + dt*z[4,t]/c.lr*sin(β))
         @NLconstraint(model, z[4,t+1] == z[4,t] + dt*u[1,t])
         # for HDV
-        @constraint(model, zH[1,t+1] == zH[1,t] + dt*zH[2,t] + 0.5*dt^2*uH[t])
-        @constraint(model, zH[2,t+1] == zH[2,t] + dt*uH[t])
+        @constraints(model, begin zH[:,t+1] .== zH[:,t] + dt*[zH[2,t], 0] + dt*uH[t]*[0.5*dt, 1] end)
     end
 
     # Initial condition
@@ -198,10 +197,11 @@ function linearizedMPC(c::MPC, vd_H; solver = "Ipopt")
         model = JuMP.Model(Ipopt.Optimizer)
     end
     set_silent(model)
-    set_time_limit_sec(model, 0.2)
+    set_time_limit_sec(model, 0.1)
     set_optimizer_attribute(model, "tol", 1e-3)
     set_optimizer_attribute(model, "max_iter", 100)
-    
+    # set_optimizer_attribute(model, "linear_solver", "ma27")
+
     # Define decision variables
     @variables model begin
         z[1:4, 1:c.H+1]
@@ -211,6 +211,7 @@ function linearizedMPC(c::MPC, vd_H; solver = "Ipopt")
         # s[1:2, 1:c.H+1]
     end
 
+    # Set initial values for the optimization variables 
     warm_u = hcat(c.u_nom[:,2:end], zeros(2,1))
     set_nominal(c, warm_u)
     set_start_value.(u, c.u_nom)
@@ -222,13 +223,10 @@ function linearizedMPC(c::MPC, vd_H; solver = "Ipopt")
         # β = @expression(model, u[2,t]*c.lr/(c.lf+c.lr))
         β_nom = atan(tan(c.u_nom[2,t])*c.lr/(c.lf+c.lr))
         θ_nom = c.st_nom[3,t]; v_nom = c.st_nom[4,t] 
-        @constraint(model, z[1,t+1] == z[1,t] + dt*(v_nom*cos(θ_nom+β_nom) - v_nom*sin(θ_nom+β_nom)*(z[3,t]-θ_nom+u[2,t]*c.lr/(c.lf+c.lr)-β_nom) + cos(θ_nom+β_nom)*(z[4,t]-v_nom)) )
-        @constraint(model, z[2,t+1] == z[2,t] + dt*(v_nom*sin(θ_nom+β_nom) + v_nom*cos(θ_nom+β_nom)*(z[3,t]-θ_nom+u[2,t]*c.lr/(c.lf+c.lr)-β_nom) + sin(θ_nom+β_nom)*(z[4,t]-v_nom)) )
-        @constraint(model, z[3,t+1] == z[3,t] + dt*(v_nom*sin(β_nom) + v_nom*cos(β_nom)*(u[2,t]*c.lr/(c.lf+c.lr)-β_nom) + sin(β_nom)*(z[4,t]-v_nom))/c.lr)
-        @constraint(model, z[4,t+1] == z[4,t] + dt*u[1,t])
+        r, A, B = construct_linear_matrix(c, v_nom, θ_nom, β_nom)
+        @constraints(model, begin z[:,t+1] .== z[:,t] + dt*(r+A*z[:,t] + B*u[:,t]) end)
         # for HDV
-        @constraint(model, zH[1,t+1] == zH[1,t] + dt*zH[2,t] + 0.5*dt^2*uH[t])
-        @constraint(model, zH[2,t+1] == zH[2,t] + dt*uH[t])
+        @constraints(model, begin zH[:,t+1] .== zH[:,t] + dt*[zH[2,t], 0] + dt*uH[t]*[0.5*dt, 1] end)
     end
 
     # Initial condition
@@ -272,4 +270,24 @@ function linearizedMPC(c::MPC, vd_H; solver = "Ipopt")
     sol = value.(u)
     set_nominal(c, sol)
     return sol, t_comp
+end
+
+function construct_linear_matrix(c::MPC, v_nom::Float64, θ_nom::Float64, β_nom::Float64)
+    r = [v_nom*cos(θ_nom+β_nom)+v_nom*sin(θ_nom+β_nom)*(θ_nom+β_nom)-cos(θ_nom+β_nom)*v_nom,
+    v_nom*sin(θ_nom+β_nom)-v_nom*cos(θ_nom+β_nom)*(θ_nom+β_nom)-sin(θ_nom+β_nom)*v_nom,
+    (v_nom*sin(β_nom)-β_nom*v_nom*cos(β_nom)-v_nom*sin(β_nom))/c.lr,
+    0]
+    A = zeros(4,4)
+    A[1,3] = -v_nom*sin(θ_nom+β_nom)
+    A[1,4] = cos(θ_nom+β_nom)
+    A[2,3] = v_nom*cos(θ_nom+β_nom)
+    A[2,4] = sin(θ_nom+β_nom)
+    A[3,4] = sin(β_nom)/c.lr
+    B = zeros(4,2)
+    B[1,2] = -v_nom*sin(θ_nom+β_nom)*c.lr/(c.lf+c.lr)
+    B[2,2] = v_nom*cos(θ_nom+β_nom)*c.lr/(c.lf+c.lr)
+    B[3,2] = v_nom*cos(β_nom)*c.lr/(c.lf+c.lr)
+    B[4,1] = 1 
+
+    return r, A, B
 end

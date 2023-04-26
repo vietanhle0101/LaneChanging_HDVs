@@ -7,16 +7,18 @@
 # end
 
 # Dynamics: Kinematic model
-# function car_ode!(du,u,p,t)
-#     θ = u[3]; v = u[4]
-#     a = p[1]; δ = p[2]
-#     lf = p[3]; lr = p[4]
-#     β = atan(lr/(lf+lr)*tan(δ))
-#     du[1] = v*cos(θ+β)
-#     du[2] = v*sin(θ+β)
-#     du[3] = v/lr*sin(β)
-#     du[4] = a
-# end
+function car_model(x, u, dt, p)
+    θ = x[3]; v = x[4]
+    a = u[1]; δ = u[2]
+    lf = p[1]; lr = p[2]
+    β = atan(lr/(lf+lr)*tan(δ))
+    dx = zeros(4)
+    dx[1] = v*cos(θ+β)
+    dx[2] = v*sin(θ+β)
+    dx[3] = v/lr*sin(β)
+    dx[4] = a
+    return x + dt*dx
+end
 
 "Class for vehicles"
 mutable struct Car
@@ -56,31 +58,27 @@ function set_limit(c::Car, bounds, parameters)
 end
 
 "Run"
-function run_lane_changing(c::Car, U; nn = 100)
+function run_lane_changing(c::Car, U; nn = 200)
     dt = c.T/nn
     a = min(c.a_max, max(c.a_min, U[1]))
     α = min(c.α_max, max(c.α_min, U[2]))
     c.u = [a, α]
     for k in 1:nn
         # Update state with the solution, and return it
-        _, _, θ, v = c.st
-        β = atan(c.lr*tan(α)/(c.lf+c.lr))
-        c.st += dt*[v*cos(θ+β), v*sin(θ+β), v/c.lr*sin(β), a]
+        c.st = car_model(c.st, c.u, dt, [c.lf, c.lr])
     end
     c.X_hist = hcat(c.X_hist, c.st)
     c.U_hist = hcat(c.U_hist, c.u)
 end
 
-function run_car_following(c::Car, v_d; nn = 100)
+function run_car_following(c::Car, v_d; nn = 200)
     dt = c.T/nn
     for k in 1:nn
         a = min(c.a_max, max(c.a_min, PID(c, v_d)))
         α = 0.0
         c.u = [a, α]
         # Update state with the solution, and return it
-        _, _, θ, v = c.st
-        β = atan(c.lr*tan(α)/(c.lf+c.lr))
-        c.st += dt*[v*cos(θ+β), v*sin(θ+β), v/c.lr*sin(β), a]
+        c.st = car_model(c.st, c.u, dt, [c.lf, c.lr])
     end
     c.X_hist = hcat(c.X_hist, c.st)
     c.U_hist = hcat(c.U_hist, c.u)
@@ -95,4 +93,9 @@ end
 function PID(c::Car, vd; Kp = 1e0)
     v = c.st[4]
     return Kp*(vd-v)
+end
+
+"Compute the distance between two cars"
+function distance(car_i::Car, car_j::Car)
+    return sqrt((car_i.st[1]-car_j.st[1])^2 + (car_i.st[2]-car_j.st[2])^2)
 end
