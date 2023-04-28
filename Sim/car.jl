@@ -85,7 +85,8 @@ function run_car_following(c::Car, v_d; nn = 200)
 end
 
 "Function to find the desired speed from constant time headway car-following model"
-function CTH(c::Car, dist, τs, ds)
+function CTH(c::Car, dist, CFM_params)
+    τs = CFM_params["τs"];  ds = CFM_params["ds"]
     return min(c.v_max, max(c.v_min, (dist-ds)/τs)) 
 end
 

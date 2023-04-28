@@ -1,4 +1,4 @@
-# push!(LOAD_PATH, ".")
+push!(LOAD_PATH, ".")
 using Pkg; Pkg.activate("."); Pkg.instantiate()
 using Plots, GaussianProcesses, Random, DelimitedFiles
 
@@ -16,14 +16,15 @@ Random.seed!(16);
 # velocity and input bounds
 bounds = Dict("v_min" => 0.0, "v_max" => 30.0, "a_min" => -3.0, "a_max" => 2.0, "α_min" => -π/12, "α_max" => π/12)
 parameters = Dict("lf" => 1.04, "lr" => 1.54)
+CFM_params = Dict("τs" => 2.0, "ds" => 8.0)
 
 ## Initialize the car objects
 yc_i = -6.0; yc_f = 0.0
-vd = 28.0; τs = 2.0; ds = 8.0
+vd = 28.0
 
 CAV_1 = Car("CAV", 1,  T, [0.0, yc_i, 0.0, 26.6])
 HDV_2 = Car("HDV", 2, T, [30.0, yc_f, 0.0, 28.0])
-HDV_3 = Car("HDV", 3, T, [0.0, yc_f, 0.0, 28.6])
+HDV_3 = Car("HDV", 3, T, [-30.0, yc_f, 0.0, 28.6])
 Cars = [CAV_1, HDV_2, HDV_3]
 for car in Cars
     set_limit(car, bounds, parameters)
@@ -32,43 +33,40 @@ end
 control = MPC(T, H)
 set_limit(control, bounds, parameters)
 set_ref(control, yc_f, vd)
-set_state(control, CAV_1, HDV_3)
+set_state(control, CAV_1, HDV_2, HDV_3)
 set_nominal(control, zeros(2, H))
 W_AH = 1e3
 W_H2 = 10.0 .^[0.0, 1.0]
-W_H3 = 10.0 .^[-1.0, 1.0]
-weights = Dict("Wu" => [1e0, 1e2], "Wv" => 1e-1, "Wy" => 1e-2, "Wd" => W_AH, "λ" => 1e9,
-        "WHu" => W_H3[1], "WHv" => W_H3[2],
-        "y_min" => yc_i, "y_max" => yc_f, "ϵ" => 1e-9,
-        "Δθ_min" => -π/18, "Δθ_max" => π/18)
+W_H3 = 10.0 .^[1.0, -1.0]
+weights = Dict("Wu" => [1e-2, 1e2], "WΔu" => [1e0, 1e0], "Wv" => 1e-2, "Wy" => 1e-3,
+        "WHu" => W_H3[1], "WHv" => W_H3[2], "Wd" => 0.0, 
+        "y_min" => yc_i, "y_max" => yc_f, "ϵ" => 1e-3, "λ" => 1e9,
+        "Δθ_min" => -π/18, "Δθ_max" => π/18, "Δα_min" => -π/18, "Δα_max" => π/18)
 set_params(control, weights)
 
-nonlinearMPC(control, vd)
-# linearizedMPC(control, vd)
+nonlinearMPC(control, vd, CFM_params)
 
 L = 100
 t_comp = []
 for t in 1:L
     println("Time step ", t)
 
-    set_state(control, CAV_1, HDV_3)
+    set_state(control, CAV_1, HDV_2, HDV_3)
 
     # Run HDV_2 using IRL-CFM model
     u_HDV_2 = input_for_HDV(Cars, 2, 1, vd, [W_H2; W_AH])
     run_car_following(HDV_2, u_HDV_2*T + HDV_2.st[4])
 
     # Run HDV_3 using IRL-CFM model
-    vd_3 = CTH(HDV_3, HDV_2.st[1] - HDV_3.st[1], τs, ds)
-    if distance(HDV_2, HDV_3) < distance(CAV_1, HDV_3) j = 2 else j = 1 end
-    u_HDV_3 = input_for_HDV(Cars, 3, j, vd_3, [W_H3; W_AH])
+    vd_3 = CTH(HDV_3, HDV_2.st[1] - HDV_3.st[1], CFM_params)
+    u_HDV_3 = input_for_HDV(Cars, 3, 1, vd_3, [W_H3; W_AH])
     run_car_following(HDV_3, u_HDV_3*T + HDV_3.st[4])
 
     # Run CAV using MPC
     if HDV_3.st[1] - CAV_1.st[1] > 0.0 hw = HDV_3.st[1] - CAV_1.st[1] else hw = HDV_2.st[1] - CAV_1.st[1] end
-    v_cfm = CTH(CAV_1, hw, τs, ds)
+    v_cfm = CTH(CAV_1, hw, CFM_params)
     set_ref(control, yc_f, v_cfm)
-    U, solving_time = nonlinearMPC(control, vd_3)
-    # U, solving_time = linearizedMPC(control, vd_3)
+    U, solving_time = nonlinearMPC(control, vd_3, CFM_params)
     append!(t_comp, solving_time)
     run_lane_changing(CAV_1, U[:,1])
 end
@@ -95,6 +93,10 @@ plot(T_hist, dist)
 minimum(dist)
 plot(T_hist, CAV_1.U_hist[2,:])
 plot(t_comp)
+
+
+
+
 
 
 ## Look-up table to find the optimal control weights
