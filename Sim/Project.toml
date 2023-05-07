@@ -1,4 +1,6 @@
 [deps]
+AmplNLWriter = "7c4d4715-977e-5154-bfe0-e096adeac482"
+Bonmin_jll = "29cba6d7-6840-5cf2-a2fa-9bdfccfe29ea"
 Convex = "f65535da-76fb-5f13-bab9-19810c17039a"
 DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"

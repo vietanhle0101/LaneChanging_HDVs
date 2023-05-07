@@ -9,17 +9,16 @@ include("controller.jl")
 # include("estimator.jl")
 # include("util.jl")
 
+Random.seed!(16);
 T = 0.2; H = 20; G = 20
 solver = "Ipopt"
-
-Random.seed!(16);
 # velocity and input bounds
 bounds = Dict("v_min" => 0.0, "v_max" => 30.0, "a_min" => -3.0, "a_max" => 2.0, "α_min" => -π/12, "α_max" => π/12)
-parameters = Dict("lf" => 1.04, "lr" => 1.54)
+system_params = Dict("lf" => 1.04, "lr" => 1.54)
 CFM_params = Dict("τs" => 2.0, "ds" => 8.0)
 
 ## Initialize the car objects
-yc_i = -6.0; yc_f = 0.0
+yc_i = 6.0; yc_f = 0.0
 vd = 28.0
 
 CAV_1 = Car("CAV", 1,  T, [0.0, yc_i, 0.0, 26.6])
@@ -27,68 +26,103 @@ HDV_2 = Car("HDV", 2, T, [30.0, yc_f, 0.0, 28.0])
 HDV_3 = Car("HDV", 3, T, [-30.0, yc_f, 0.0, 28.6])
 Cars = [CAV_1, HDV_2, HDV_3]
 for car in Cars
-    set_limit(car, bounds, parameters)
+    set_limit(car, bounds, system_params)
 end
 
-control = MPC(T, H)
-set_limit(control, bounds, parameters)
-set_ref(control, yc_f, vd)
-set_state(control, CAV_1, HDV_2, HDV_3)
-set_nominal(control, zeros(2, H))
+Planner = MPC_Planner(T, H)
+set_limit(Planner, bounds)
+set_ref(Planner, vd)
+set_state(Planner, CAV_1, HDV_2, HDV_3)
+set_nominal(Planner, zeros(2,H))
 W_AH = 1e3
-W_H2 = 10.0 .^[0.0, 1.0]
-W_H3 = 10.0 .^[1.0, -1.0]
-weights = Dict("Wu" => [1e-2, 1e2], "WΔu" => [1e0, 1e0], "Wv" => 1e-2, "Wy" => 1e-3,
-        "WHu" => W_H3[1], "WHv" => W_H3[2], "Wd" => 0.0, 
-        "y_min" => yc_i, "y_max" => yc_f, "ϵ" => 1e-3, "λ" => 1e9,
+W_H2 = 10.0 .^[0.0, 2.0]
+W_H3 = 10.0 .^[-1.0, -0.5]
+
+weights = Dict("W_A" => [1e-1, 1e1], "W_AH" => W_AH, "W_H" => W_H3, "ϵ" => 1e-6)
+set_params(Planner, weights)
+
+LL_params = Dict("Wu" => 1e0, "WΔu" => 1e0, "Wy" => 1e-2, "Wx" => 0e2, "Wv" => 0e2,
+        "y_min" => yc_f - 3.0, "y_max" => yc_i + 3.0,
         "Δθ_min" => -π/18, "Δθ_max" => π/18, "Δα_min" => -π/18, "Δα_max" => π/18)
-set_params(control, weights)
 
-nonlinearMPC(control, vd, CFM_params)
+LLC = LL_MPC(T, H)
+set_limit(LLC, bounds)
+set_params(LLC, LL_params, system_params)
+set_state(LLC, CAV_1)
+set_nominal(LLC, zeros(2,H))
 
-L = 100
+nonlinearMPC(Planner, vd)
+lane = lane_selection(Planner, 1.0, 5.0)
+set_ref(LLC, yc_f, Planner.st_nom[1,:], Planner.st_nom[2,:])
+trackingMPC(LLC, Planner.u_nom[1,:], lane)
+count_stop = 0
+
+L = 200
 t_comp = []
 for t in 1:L
     println("Time step ", t)
 
-    set_state(control, CAV_1, HDV_2, HDV_3)
+    set_state(Planner, CAV_1, HDV_2, HDV_3)
+    set_state(LLC, CAV_1)
 
     # Run HDV_2 using IRL-CFM model
     u_HDV_2 = input_for_HDV(Cars, 2, 1, vd, [W_H2; W_AH])
     run_car_following(HDV_2, u_HDV_2*T + HDV_2.st[4])
 
     # Run HDV_3 using IRL-CFM model
-    vd_3 = CTH(HDV_3, HDV_2.st[1] - HDV_3.st[1], CFM_params)
-    u_HDV_3 = input_for_HDV(Cars, 3, 1, vd_3, [W_H3; W_AH])
+    if HDV_3.st[1] - CAV_1.st[1] > 0.0 hw = HDV_2.st[1] - HDV_3.st[1] else hw = CAV_1.st[1] - HDV_3.st[1] end
+    v3_cfm = CTH(HDV_3, hw, CFM_params)
+    u_HDV_3 = input_for_HDV(Cars, 3, 1, v3_cfm, [W_H3; W_AH])
     run_car_following(HDV_3, u_HDV_3*T + HDV_3.st[4])
 
     # Run CAV using MPC
     if HDV_3.st[1] - CAV_1.st[1] > 0.0 hw = HDV_3.st[1] - CAV_1.st[1] else hw = HDV_2.st[1] - CAV_1.st[1] end
     v_cfm = CTH(CAV_1, hw, CFM_params)
-    set_ref(control, yc_f, v_cfm)
-    U, solving_time = nonlinearMPC(control, vd_3, CFM_params)
-    append!(t_comp, solving_time)
-    run_lane_changing(CAV_1, U[:,1])
+    if t > 5 && count_stop < 25
+        set_ref(Planner, v_cfm)
+        U_ref, solving_time_1 = nonlinearMPC(Planner, v3_cfm)
+        lane = lane_selection(Planner, 1.0, 5.0)
+        set_ref(LLC, yc_f, Planner.st_nom[1,:], Planner.st_nom[2,:])
+        U, solving_time_2 = trackingMPC(LLC, Planner.u_nom[1,:], lane)
+        run_lane_changing(CAV_1, U[:,1])
+        append!(t_comp, solving_time_1 + solving_time_2)
+    elseif t <= 5 && count_stop < 25
+        run_car_following(CAV_1, v_cfm)
+    else
+        println("Changed lane")
+        break
+    end
+    if abs(CAV_1.st[2] - yc_f) < 1e-2
+        count_stop += 1
+    end
 end
 
 
 # Plot the results
-T_hist = [T*i for i in 1:L+1]
+nn = size(CAV_1.X_hist)[2]
+T_hist = [T*i for i in 1:nn] 
 
 gr()
-plot(CAV_1.X_hist[1,:], CAV_1.X_hist[2,:], color=:red)
+plot(CAV_1.X_hist[1,:], CAV_1.X_hist[2,:], ylims=(-5,10), color=:red)
 
 plot()
 for car in Cars
     car.Type == "CAV" ? c = :green : c = :red
-    display(plot!(T_hist, car.X_hist[1,:], color=c))
+    display(plot!(T_hist, car.X_hist[1,1:nn], color=c))
+end
+
+plot()
+for car in Cars
+    car.Type == "CAV" ? c = :green : c = :red
+    display(plot!(T_hist, car.X_hist[4,1:nn], color=c))
 end
 
 plot(T_hist, CAV_1.X_hist[3,:])
-plot(T_hist, CAV_1.X_hist[4,:])
-plot(T_hist, HDV_2.X_hist[4,:])
-plot(T_hist, HDV_3.X_hist[4,:])
-dist = sqrt.((HDV_3.X_hist[1,:]-CAV_1.X_hist[1,:]).^2 + (HDV_3.X_hist[2,:]-CAV_1.X_hist[2,:]).^2)
+dist = sqrt.((HDV_3.X_hist[1,1:nn]-CAV_1.X_hist[1,1:nn]).^2 + (HDV_3.X_hist[2,1:nn]-CAV_1.X_hist[2,1:nn]).^2)
+plot(T_hist, dist)
+minimum(dist)
+
+dist = sqrt.((HDV_2.X_hist[1,1:nn]-CAV_1.X_hist[1,1:nn]).^2 + (HDV_2.X_hist[2,1:nn]-CAV_1.X_hist[2,1:nn]).^2)
 plot(T_hist, dist)
 minimum(dist)
 plot(T_hist, CAV_1.U_hist[2,:])
