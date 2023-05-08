@@ -1,9 +1,9 @@
 using LinearAlgebra, Distributions, Polynomials, Roots
 using Optim, Convex, JuMP, OSQP, Ipopt
-# using Gurobi, KNITRO
+using Gurobi # , KNITRO
 
-# GRB_ENV = Gurobi.Env()
-const cutoff = 1e-3 # small cutoff in constraints to avoid numerical issues with optimization solvers
+GRB_ENV = Gurobi.Env()
+const cutoff = 1e-2 # small cutoff in constraints to avoid numerical issues with optimization solvers
 
 "Function to get control input for the HDVs in the simulation"
 function input_for_HDV(cars::Vector{Car}, my_car::Int64, your_car::Int64, vd::Float64, W; T = 0.2, γ = 1e-3, uncertain = false)
@@ -131,10 +131,15 @@ function nonlinearMPC(c::MPC_Planner, vH; solver = "Ipopt", τ0 = 1.5, d0 = 5.0)
     end
     @NLobjective(model, Min, J)
 
-    t_comp = @elapsed JuMP.optimize!(model)
-    sol = value.(u)
-    set_nominal(c, sol)
-    return sol, t_comp
+    try
+        t_comp = @elapsed JuMP.optimize!(model)
+        sol = value.(u)
+        set_nominal(c, sol)
+        return sol, t_comp
+    catch
+        println("Cannot find the solution because ", termination_status(model))
+        return c.u_nom, 0.0    
+    end
 end
 
 function lane_selection(c::MPC_Planner, τ0::Float64, d0::Float64)
@@ -182,10 +187,8 @@ function set_limit(c::LL_MPC, bounds)
 end
 
 "Set the references"
-function set_ref(c::LL_MPC, y_ref, x_ref, v_ref)
+function set_ref(c::LL_MPC, y_ref)
     c.y_ref = y_ref
-    c.x_ref = x_ref
-    c.v_ref = v_ref
 end
 
 "Set state from all states"
@@ -217,8 +220,9 @@ function set_nominal(c::LL_MPC, nom_inputs::AbstractMatrix)
 end
 
 "Function to solve MPC tracking control problem"
-function trackingMPC(c::LL_MPC, U_ref, lane; solver = "Ipopt", τ0 = 1.0, d0 = 5.0, M = 1e3)
+function trackingMPC(c::LL_MPC, p::MPC_Planner, lane; solver = "Ipopt", τ0 = 1.0, d0 = 5.0)
     dt = c.T; y_ref = c.y_ref; x_ref = c.x_ref; v_ref = c.v_ref
+    U_ref = p.u_nom[1,:]
     if solver == "Ipopt"
         model = JuMP.Model(Ipopt.Optimizer)
     end
@@ -256,8 +260,8 @@ function trackingMPC(c::LL_MPC, U_ref, lane; solver = "Ipopt", τ0 = 1.0, d0 = 5
 
     # Bound constraints
     @constraints(model, begin
-        # c.a_min .<= u[1,:] .<= c.a_max
         c.α_min .<= u[2,:] .<= c.α_max
+        # c.a_min .<= u[1,:] .<= c.a_max
         # c.v_min .<= z[4,:] .<= c.v_max
     end)
 
@@ -274,9 +278,9 @@ function trackingMPC(c::LL_MPC, U_ref, lane; solver = "Ipopt", τ0 = 1.0, d0 = 5
     end)
 
     # Safety constraints
-    if lane == 1 && c.st[2] - c.y_ref >= d0
+    if lane == 1 && c.st[2] - y_ref >= d0
         @constraints(model, begin
-            d0 .<= z[2,:] - c.y_ref
+            d0 .<= z[2,:] - y_ref
         end)
     end
 
@@ -287,110 +291,207 @@ function trackingMPC(c::LL_MPC, U_ref, lane; solver = "Ipopt", τ0 = 1.0, d0 = 5
     
     @objective(model, Min, J)
 
-    t_comp = @elapsed JuMP.optimize!(model)
-    sol = value.(u)
-    set_nominal(c, sol)
-    return sol, t_comp
+    try
+        t_comp = @elapsed JuMP.optimize!(model)
+        sol = value.(u)
+        set_nominal(c, sol)
+        return sol, t_comp
+    catch
+        println("Cannot find the solution because ", termination_status(model))
+        return c.u_nom, 0.0    
+    end
 end
 
-# function linearizedMPC(c::MPC, vd_H; solver = "Ipopt")
-#     y_ref = c.y_ref; vd = c.v_ref; dt = c.T; ϵ = c.params["ϵ"]
-#     c.solver = solver
-#     if c.solver == "Ipopt"
-#         model = JuMP.Model(Ipopt.Optimizer)
-#     end
-#     set_silent(model)
-#     set_time_limit_sec(model, 0.1)
-#     set_optimizer_attribute(model, "tol", 1e-3)
-#     set_optimizer_attribute(model, "max_iter", 100)
-#     # set_optimizer_attribute(model, "linear_solver", "ma27")
+function lin_trackingMPC(c::LL_MPC, p::MPC_Planner, lane; solver = "Gurobi", τ0 = 1.0, d0 = 5.0)
+    dt = c.T; y_ref = c.y_ref
+    U_ref = p.u_nom[1,:]    
+    if solver == "Ipopt"
+        model = JuMP.Model(Ipopt.Optimizer)
+    elseif solver == "OSQP"
+        model = JuMP.Model(OSQP.Optimizer)
+    end
 
-#     # Define decision variables
-#     @variables model begin
-#         z[1:4, 1:c.H+1]
-#         u[1:2, 1:c.H]
-#         zH[1:2, 1:c.H+1]
-#         uH[1:c.H]
-#         # s[1:2, 1:c.H+1]
-#     end
+    set_time_limit_sec(model, 0.2)
+    set_optimizer_attribute(model, "tol", 1e-3)
+    set_optimizer_attribute(model, "max_iter", 100)
+    set_silent(model)
 
-#     # Set initial values for the optimization variables 
-#     warm_u = hcat(c.u_nom[:,2:end], zeros(2,1))
-#     set_nominal(c, warm_u)
-#     set_start_value.(u, c.u_nom)
-#     set_start_value.(z, c.st_nom)
+    # Define decision variables
+    @variables model begin
+        z[1:4, 1:c.H+1]
+        u[1:2, 1:c.H]
+    end
+
+    # Set initial values for the optimization variables 
+    warm_u = hcat(c.u_nom[:,2:end], zeros(2,1))
+    set_nominal(c, warm_u)
+    set_start_value.(u, c.u_nom)
+    set_start_value.(z, c.st_nom)
     
-#     # Add dynamics constraints
-#     for t = 1:c.H
-#         # for CAV
-#         # β = @expression(model, u[2,t]*c.lr/(c.lf+c.lr))
-#         β_nom = atan(tan(c.u_nom[2,t])*c.lr/(c.lf+c.lr))
-#         θ_nom = c.st_nom[3,t]; v_nom = c.st_nom[4,t] 
-#         r, A, B = construct_linear_matrix(c, v_nom, θ_nom, β_nom)
-#         @constraints(model, begin z[:,t+1] .== z[:,t] + dt*(r+A*z[:,t] + B*u[:,t]) end)
-#         # for HDV
-#         @constraints(model, begin zH[:,t+1] .== zH[:,t] + dt*[zH[2,t], 0] + dt*uH[t]*[0.5*dt, 1] end)
-#     end
+    # Add dynamics constraints
+    for t = 1:c.H
+        # for CAV
+        α_nom = c.u_nom[2,t]; θ_nom = c.st_nom[3,t]; v_nom = c.st_nom[4,t] 
+        r, A, B = construct_linear_matrix(c, v_nom, θ_nom, α_nom)
+        @constraints(model, begin z[:,t+1] .== z[:,t] + dt*(r + A*z[:,t] + B*u[:,t]) end)
+    end
 
-#     # Initial condition
-#     @constraint(model, z[:,1] .== c.st)
-#     @constraint(model, zH[:,1] .== [c.st_H[1], c.st_H[4]])
+    # Initial condition
+    @constraint(model, z[:,1] .== c.st)
+    @constraint(model, u[1,:] .== U_ref)
+
+    # Bound constraints
+    @constraints(model, begin
+        c.α_min .<= u[2,:] .<= c.α_max
+        # c.a_min .<= u[1,:] .<= c.a_max
+        # c.v_min .<= z[4,:] .<= c.v_max
+    end)
+
+    @constraints(model, begin
+        c.params["y_min"] .<= z[2,:] .<= c.params["y_max"]
+    end)
+
+    # Ramp constraints
+    @constraints(model, begin
+        c.params["Δθ_min"]*dt <= z[3,1] - c.st[3] <= c.params["Δθ_max"]*dt
+        c.params["Δθ_min"]*dt .<= z[3,2:end] - z[3,1:end-1] .<= c.params["Δθ_max"]*dt
+        c.params["Δα_min"]*dt <= u[2,1] - c.u[2] <= c.params["Δα_max"]*dt
+        c.params["Δα_min"]*dt .<= u[2,2:end] - u[2,1:end-1] .<= c.params["Δα_max"]*dt
+    end)
+
+    # Safety constraints
+    if lane == 1 && c.st[2] - y_ref >= d0
+        @constraints(model, begin
+            d0 .<= z[2,:] - y_ref
+        end)
+    end
+
+    # Objective function
+    J = sum(c.params["Wu"]*u[2,:].^2) + sum(c.params["Wy"]*(z[2,:] .- y_ref).^2)
+        + sum(c.params["WΔu"]*(u[2,1]-c.u[2]).^2) + sum(c.params["WΔu"]*(u[2,2:end]-u[2,1:end-1]).^2) 
+        # + sum(c.params["Wx"]*(z[1,:]-x_ref).^2) + + sum(c.params["Wv"]*(z[4,:]-v_ref).^2)
     
-#     # Bound constraints
-#     @constraints(model, begin
-#         c.a_min .<= u[1,:] .<= c.a_max
-#         c.α_min .<= u[2,:] .<= c.α_max
-#         c.v_min .<= z[4,:] .<= c.v_max
-#         # 0.0 .<= s
-#     end)
+    @objective(model, Min, J)
 
-#     @constraints(model, begin
-#         # c.params["y_min"] .<= z[2,:] .+ s[1,:] 
-#         # -c.params["y_max"] .<= -z[2,:] .+ s[2,:] 
-#         c.params["y_min"] .<= z[2,:] .<= c.params["y_max"]
-#     end)
+    try
+        t_comp = @elapsed JuMP.optimize!(model)
+        sol = value.(u)
+        set_nominal(c, sol)
+        return sol, t_comp
+    catch
+        println("Cannot find the solution because ", termination_status(model))
+        return c.u_nom, 0.0    
+    end
+end
 
-#     # Ramp constraints
-#     @constraints(model, begin
-#         c.params["Δθ_min"]*dt <= z[3,1] - c.st[3] <= c.params["Δθ_max"]*dt
-#         c.params["Δθ_min"]*dt .<= z[3,2:end] - z[3,1:end-1] .<= c.params["Δθ_max"]*dt
-#     end)
+function MIP_trackingMPC(c::LL_MPC, p::MPC_Planner; solver = "Gurobi", τ0 = 1.0, d0 = 5.0, M = 1e3)
+    dt = c.T; y_ref = c.y_ref
+    U_ref = p.u_nom[1,:]
+    x_CAV = p.st_nom[1,:]; v_CAV = p.st_nom[2,:] 
+    x_HDV = p.st_nom[3,:]; v_HDV = p.st_nom[4,:] 
 
-#     # Objective function
-#     J = sum(c.params["Wu"].*u.^2) + sum(c.params["Wv"]*(z[4,:] .- vd).^2) + sum(c.params["Wy"]*(z[2,:] .- y_ref).^2)
-#                 + sum(c.params["WHu"].*uH.^2) + sum(c.params["Wv"]*(zH[2,:] .- vd_H).^2)
-#                 # + c.params["λ"]*sum(s)
-#     for k in 1:c.H
-#         xi = z[1,k+1]; yi = z[2,k+1]
-#         xj = zH[1,k+1]
-#         J = @NLexpression(model, J - c.params["Wd"]*log((xi-xj)^2 + yi^2 + ϵ))
-#         # @constraint(model, 5.0^2 <= (xi-xj)^2 + yi^2)
-#     end
-#     @NLobjective(model, Min, J)
-#     # Safety constraints
+    if solver == "Gurobi"
+        model = JuMP.Model(() -> Gurobi.Optimizer(GRB_ENV))
+        set_silent(model)
+        set_optimizer_attribute(model, "OutputFlag", 0)
+        set_optimizer_attribute(model, "OptimalityTol", 1e-3)         	
+        set_optimizer_attribute(model, "FeasibilityTol", 1e-3) 
+    end
 
-#     t_comp = @elapsed JuMP.optimize!(model)
-#     sol = value.(u)
-#     set_nominal(c, sol)
-#     return sol, t_comp
-# end
+    # Define decision variables
+    @variables model begin
+        z[1:4, 1:c.H+1]
+        u[1:2, 1:c.H]
+    end
+    @variable(model, b1[1:c.H], Bin) # define the binary variable
+    @variable(model, b2[1:c.H], Bin) # define the binary variable
 
-# function construct_linear_matrix(c::MPC, v_nom::Float64, θ_nom::Float64, β_nom::Float64)
-#     r = [v_nom*cos(θ_nom+β_nom)+v_nom*sin(θ_nom+β_nom)*(θ_nom+β_nom)-cos(θ_nom+β_nom)*v_nom,
-#     v_nom*sin(θ_nom+β_nom)-v_nom*cos(θ_nom+β_nom)*(θ_nom+β_nom)-sin(θ_nom+β_nom)*v_nom,
-#     (v_nom*sin(β_nom)-β_nom*v_nom*cos(β_nom)-v_nom*sin(β_nom))/c.lr,
-#     0]
-#     A = zeros(4,4)
-#     A[1,3] = -v_nom*sin(θ_nom+β_nom)
-#     A[1,4] = cos(θ_nom+β_nom)
-#     A[2,3] = v_nom*cos(θ_nom+β_nom)
-#     A[2,4] = sin(θ_nom+β_nom)
-#     A[3,4] = sin(β_nom)/c.lr
-#     B = zeros(4,2)
-#     B[1,2] = -v_nom*sin(θ_nom+β_nom)*c.lr/(c.lf+c.lr)
-#     B[2,2] = v_nom*cos(θ_nom+β_nom)*c.lr/(c.lf+c.lr)
-#     B[3,2] = v_nom*cos(β_nom)*c.lr/(c.lf+c.lr)
-#     B[4,1] = 1 
+    # Set initial values for the optimization variables 
+    warm_u = hcat(c.u_nom[:,2:end], zeros(2,1))
+    set_nominal(c, warm_u)
+    set_start_value.(u, c.u_nom)
+    set_start_value.(z, c.st_nom)
+    
+    # Add dynamics constraints
+    for t = 1:c.H
+        # for CAV
+        α_nom = c.u_nom[2,t]; θ_nom = c.st_nom[3,t]; v_nom = c.st_nom[4,t] 
+        r, A, B = construct_linear_matrix(c, v_nom, θ_nom, α_nom)
+        @constraints(model, begin z[:,t+1] .== z[:,t] + dt*(r + A*z[:,t] + B*u[:,t]) end)
+    end
 
-#     return r, A, B
-# end
+    # Initial condition
+    @constraint(model, z[:,1] .== c.st)
+    @constraint(model, u[1,:] .== U_ref)
+
+    # Bound constraints
+    @constraints(model, begin
+        c.α_min .<= u[2,:] .<= c.α_max
+        # c.a_min .<= u[1,:] .<= c.a_max
+        # c.v_min .<= z[4,:] .<= c.v_max
+    end)
+
+    @constraints(model, begin
+        c.params["y_min"] .<= z[2,:] .<= c.params["y_max"]
+    end)
+
+    # Ramp constraints
+    @constraints(model, begin
+        c.params["Δθ_min"]*dt <= z[3,1] - c.st[3] <= c.params["Δθ_max"]*dt
+        c.params["Δθ_min"]*dt .<= z[3,2:end] - z[3,1:end-1] .<= c.params["Δθ_max"]*dt
+        c.params["Δα_min"]*dt <= u[2,1] - c.u[2] <= c.params["Δα_max"]*dt
+        c.params["Δα_min"]*dt .<= u[2,2:end] - u[2,1:end-1] .<= c.params["Δα_max"]*dt
+    end)
+
+    # Safety constraints
+    if c.st[2] - y_ref >= d0
+        h12 = x_HDV - (x_CAV + τ0*v_CAV)
+        h21 = x_CAV - (x_HDV + τ0*v_HDV)
+        for k in 1:c.H
+            @constraints(model, begin
+                y_ref + d0 - M*b1[k] <= z[2,k+1]
+                d0 - M*(1 − b1[k] + b2[k]) <= h12[k+1]
+                d0 - M*(2 − b1[k] - b2[k]) <= h21[k+1]
+            end)
+        end
+    end
+
+    # Objective function
+    J = sum(c.params["Wu"]*u[2,:].^2) + sum(c.params["Wy"]*(z[2,:] .- y_ref).^2)
+        + sum(c.params["WΔu"]*(u[2,1]-c.u[2]).^2) + sum(c.params["WΔu"]*(u[2,2:end]-u[2,1:end-1]).^2) 
+        # + sum(c.params["Wx"]*(z[1,:]-x_ref).^2) + + sum(c.params["Wv"]*(z[4,:]-v_ref).^2)
+    
+    @objective(model, Min, J)
+
+    try
+        t_comp = @elapsed JuMP.optimize!(model)
+        sol = value.(u)
+        set_nominal(c, sol)
+        return sol, t_comp
+    catch
+        println("Cannot find the solution because ", termination_status(model))
+        return c.u_nom, 0.0    
+    end
+end
+
+function construct_linear_matrix(c::LL_MPC, v_nom::Float64, θ_nom::Float64, α_nom::Float64)
+    ν = c.lr/(c.lf+c.lr)
+    β_nom = ν*α_nom
+    r = [v_nom*cos(θ_nom+β_nom) + v_nom*sin(θ_nom+β_nom)*(θ_nom+β_nom) - cos(θ_nom+β_nom)*v_nom,
+    v_nom*sin(θ_nom+β_nom) - v_nom*cos(θ_nom+β_nom)*(θ_nom+β_nom) - sin(θ_nom+β_nom)*v_nom,
+    (v_nom*sin(β_nom) - β_nom*v_nom*cos(β_nom) - v_nom*sin(β_nom))/c.lr,
+    0]
+    A = zeros(4,4)
+    A[1,3] = -v_nom*sin(θ_nom+β_nom)
+    A[1,4] = cos(θ_nom+β_nom)
+    A[2,3] = v_nom*cos(θ_nom+β_nom)
+    A[2,4] = sin(θ_nom+β_nom)
+    A[3,4] = sin(β_nom)/c.lr
+    B = zeros(4,2)
+    B[1,2] = -v_nom*sin(θ_nom+β_nom)*ν
+    B[2,2] = v_nom*cos(θ_nom+β_nom)*ν
+    B[3,2] = v_nom*cos(β_nom)*ν/c.lr
+    B[4,1] = 1 
+
+    return r, A, B
+end

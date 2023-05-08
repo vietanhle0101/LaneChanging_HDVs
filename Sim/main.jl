@@ -11,7 +11,6 @@ include("controller.jl")
 
 Random.seed!(16);
 T = 0.2; H = 20; G = 20
-solver = "Ipopt"
 # velocity and input bounds
 bounds = Dict("v_min" => 0.0, "v_max" => 30.0, "a_min" => -3.0, "a_max" => 2.0, "α_min" => -π/12, "α_max" => π/12)
 system_params = Dict("lf" => 1.04, "lr" => 1.54)
@@ -53,8 +52,8 @@ set_nominal(LLC, zeros(2,H))
 
 nonlinearMPC(Planner, vd)
 lane = lane_selection(Planner, 1.0, 5.0)
-set_ref(LLC, yc_f, Planner.st_nom[1,:], Planner.st_nom[2,:])
-trackingMPC(LLC, Planner.u_nom[1,:], lane)
+set_ref(LLC, yc_f)
+MIP_trackingMPC(LLC, Planner)
 count_stop = 0
 
 L = 200
@@ -82,8 +81,7 @@ for t in 1:L
         set_ref(Planner, v_cfm)
         U_ref, solving_time_1 = nonlinearMPC(Planner, v3_cfm)
         lane = lane_selection(Planner, 1.0, 5.0)
-        set_ref(LLC, yc_f, Planner.st_nom[1,:], Planner.st_nom[2,:])
-        U, solving_time_2 = trackingMPC(LLC, Planner.u_nom[1,:], lane)
+        U, solving_time_2 = MIP_trackingMPC(LLC, Planner)
         run_lane_changing(CAV_1, U[:,1])
         append!(t_comp, solving_time_1 + solving_time_2)
     elseif t <= 5 && count_stop < 25
@@ -254,3 +252,10 @@ println("THAT IS THE END !!!")
 coeffs = [1, -2, -2, 1]
 @elapsed roots(Polynomial(coeffs))
 @elapsed find_zero(Polynomial(coeffs), (-1e3, 1e3), Bisection())[end]
+
+
+# To build GUROBI
+ENV["GUROBI_HOME"] = "/Library/gurobi950/mac64"
+import Pkg
+Pkg.add("Gurobi")
+Pkg.build("Gurobi")
